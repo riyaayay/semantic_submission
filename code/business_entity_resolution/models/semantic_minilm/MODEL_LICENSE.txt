@@ -1,0 +1,10 @@
+Model: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+Revision: e8f8c211226b894fcb81acc59f3b34ba3efd5f42 (Hugging Face Hub)
+License: Apache-2.0
+Parameters: 117.65M (embedding dim 384, max sequence length 128; used with 64)
+Use: inference only (no fine-tuning); multilingual name/address embeddings for
+semantic blocking and similarity features in the v9 matcher.
+Audit record: runs/neural_retrieval_pilot/run_001/stage2_checkpoint_audit.json
+Storage: weights saved in float16 (the pipeline loads the model with .half(), so inference is
+bit-identical to the float32 original; verified on 9,007 names/addresses). Original float32 copy:
+runs/neural_retrieval_pilot/run_001/model_checkpoint.

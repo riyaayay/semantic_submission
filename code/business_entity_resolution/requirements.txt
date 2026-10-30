@@ -1,0 +1,29 @@
+# Complete GPU-accelerated dependency manifest for Amazon ML Challenge 2026
+# Hardware Target: NVIDIA GeForce RTX 5070 Ti Laptop GPU (CUDA 13.0)
+catboost==1.2.10
+cloudpickle==3.1.2
+colorama==0.4.6
+lightgbm==4.7.0
+matplotlib==3.11.2
+numpy==2.4.6
+optuna==5.0.0
+pandas==3.0.6
+plotly==7.1.0
+polars==1.44.2
+polars-runtime-32==1.44.2
+pyarrow==25.0.1
+rapidfuzz==3.14.6
+scikit-learn==1.9.1
+scipy==1.17.1
+torch==2.15.0.dev20260926+cu130
+torchaudio==2.11.0.dev20260926+cu130
+torchvision==0.30.0.dev20260926+cu130
+tqdm==4.70.1
+xgboost==3.2.0
+# v8/v9 GPU pipeline: XGBoost reads CUDA tensors through CuPy (CUDA 13 build + toolkit headers)
+cupy-cuda13x[ctk]==14.2.0
+# v9 multilingual semantic layer (model weights shipped in models/semantic_minilm)
+sentence-transformers==6.1.0
+transformers==5.17.0
+# tests (code/business_entity_resolution/tests)
+pytest==9.1.1
