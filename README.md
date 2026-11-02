@@ -88,27 +88,27 @@ Threshold tau = 0.65, 1-to-many exclusive assignment
 
 ## 4. AWS Lakehouse Deployment
 
-### Why S3 + Glue + Athena?
+### Services used and honest cost breakdown
 
-The TSV outputs are 2.83 GB of flat files. Converting them to Snappy-compressed, country-partitioned Parquet and registering them in Athena lets any SQL tool query the results without keeping a Python process or GPU running.
+| Service | Used for | Free tier? | Estimated cost |
+|---------|----------|-----------|----------------|
+| **S3** | Store 1.06 GB Parquet (15 objects) | Yes (5 GB free) | \$0.00 |
+| **Glue Data Catalog** | Register 4 external Hive-partitioned tables | Yes (< 1 M objects) | \$0.00 |
+| **Athena** | Serverless SQL over S3 Parquet | No free tier | ~\$0.0053 full scan / ~\$0.0002–\$0.0006 single partition |
+| **Glue ETL job** (PySpark) | Re-generate Parquet from raw TSVs on demand | No | ~\$0.18 per run (2 DPU × ~12 min × \$0.44/DPU-hr) |
+| **Lambda** | Quality-gate trigger on S3 event or schedule | Yes (1 M free/month) | \$0.00 |
+| **EventBridge** | Daily schedule → Lambda | Yes | \$0.00 |
+| **Redshift Serverless** | Cross-engine verification; compare query runtime | 90-day free trial | ~\$0.13 per verification run (8 RPU × ~10 min) |
 
-**Cost on this dataset (Athena at \$5 / TB scanned):**
-
-| Query scope | Data scanned | Estimated cost |
-|-------------|-------------|----------------|
-| All 4 tables, all countries | ~1.06 GB | ~\$0.0053 |
-| Single country partition only | ~35–120 MB | ~\$0.0002–\$0.0006 |
-
-> **Note:** Partition pruning (e.g. `WHERE country = 'France'`) reduces the bytes Athena actually reads. The figures above are estimates; exact bytes scanned are shown in the Athena console's *Query statistics* tab after each run.
-
-**Free-tier usage:** S3 (15 objects, 1,058 MB) stays within the 5 GB free tier. Glue Data Catalog table registrations are free under 1 M objects. Athena has no free tier; each query above costs a fraction of a cent.
+> All cost figures use ap-south-1 pricing as of November 2026. Exact Athena bytes scanned are shown in the console *Query statistics* tab. Set a billing alarm before running the Glue job or Redshift.
 
 ### Architecture
 
 ```
 [Local GPU inference — 11.7 M records, 128.7 M pairs]
                   |
-                  v  export_lakehouse.py (~10 min, local)
+                  v  export_lakehouse.py  (local, ~10 min)
+                  |  OR glue_etl_job.py   (Glue Spark, ~12 min, ~$0.18)
 +------------------------------------------------------------+
 |  Kimball Star Schema — Snappy Parquet                      |
 |  dim_canonical_entity   1.73 M rows   311.7 MB            |
@@ -119,25 +119,37 @@ The TSV outputs are 2.83 GB of flat files. Converting them to Snappy-compressed,
                   |
                   v  s3_upload.py (~5 min)
 +------------------------------------------------------------+
-|  Amazon S3                                                 |
-|  s3://riya-entity-lakehouse-2026/lakehouse_gold/           |
+|  Amazon S3 — s3://riya-entity-lakehouse-2026/              |
 +------------------------------------------------------------+
-                  |
-                  v  athena_warehouse_ddl.sql (~5 min)
-+------------------------------------------------------------+
-|  AWS Glue Data Catalog + Amazon Athena                     |
-|  database: entity_resolution_dw (4 external tables)       |
-+------------------------------------------------------------+
+         |                        |
+         v  Glue crawler          v  athena_warehouse_ddl.sql
++------------------+   +------------------------------+
+|  AWS Glue        |   |  Amazon Athena               |
+|  Data Catalog    |-->|  entity_resolution_dw DB     |
+|  (Hive-style     |   |  4 external tables           |
+|  partitions)     |   |  partition pruning by country|
++------------------+   +------------------------------+
+                                  |
+         S3 ObjectCreated event   |
+         or EventBridge schedule  |
+                  |               v
+         +--------+-----+   +--------------------+
+         |  Lambda       |   | Redshift Serverless|
+         |  quality gate |   | COPY + same queries|
+         |  (5 checks)   |   | runtime comparison |
+         +---------------+   +--------------------+
 ```
 
 ### Live query results
 
 Committed in [`aws_results/`](aws_results/):
 
-| File | Contents |
-|------|----------|
-| [`query1_quality_gate.csv`](aws_results/query1_quality_gate.csv) | Mutual-exclusivity audit per country |
-| [`query2_executive_rollup.csv`](aws_results/query2_executive_rollup.csv) | Blocking telemetry + singleton rates |
+| File | Engine | Contents |
+|------|--------|----------|
+| [`query1_quality_gate.csv`](aws_results/query1_quality_gate.csv) | Athena | Mutual-exclusivity audit per country |
+| [`query2_executive_rollup.csv`](aws_results/query2_executive_rollup.csv) | Athena | Blocking telemetry + singleton rates |
+| `redshift_query1_quality_gate.csv` | Redshift Serverless | Same Q1 — generated by `redshift_verify.py` |
+| `redshift_query2_executive_rollup.csv` | Redshift Serverless | Same Q2 — generated by `redshift_verify.py` |
 
 ---
 
@@ -181,15 +193,31 @@ python ../../6ab10eb3b23ba_student_resource/student_resource/utils/validate_subm
 
 Expected: `PASS — no blocking issues found.`
 
-### C. Build the Star Schema Parquet (local, ~10 min)
+### C. Build the Star Schema Parquet
 
+**Option 1 — local (no AWS cost, ~10 min):**
 ```bash
 cd code/business_entity_resolution/src
 python export_lakehouse.py
 # Writes output/lakehouse_gold/ (4 tables, ~1.06 GB total)
 ```
 
-### D. Upload to S3 (~5 min)
+**Option 2 — Glue PySpark job (~12 min, ~$0.18):**
+
+First upload the raw TSVs to S3 under the `raw-input/` prefix, then run the job:
+```bash
+# Upload script is self-contained; set env vars then:
+python deploy/s3_upload.py          # uploads lakehouse_gold/ Parquet
+
+# OR trigger the Glue job (after bootstrap — see step F):
+aws glue start-job-run --job-name entity-resolution-etl
+```
+
+The Glue job ([`deploy/glue_etl_job.py`](deploy/glue_etl_job.py)) runs the same
+Kimball star-schema transforms as `export_lakehouse.py` but as a distributed
+PySpark job on Glue 4.0 (Spark 3.3), writing directly to S3.
+
+### D. Upload Parquet to S3 (~5 min)
 
 ```bash
 aws configure          # region: ap-south-1
@@ -204,6 +232,54 @@ python deploy/s3_upload.py
 1. Open the [Athena console](https://ap-south-1.console.aws.amazon.com/athena/home?region=ap-south-1).
 2. Set query result location to `s3://riya-entity-lakehouse-2026/athena-results/`.
 3. Run all statements in `sql/athena_warehouse_ddl.sql` (CREATE DATABASE, 4 × CREATE EXTERNAL TABLE, 4 × MSCK REPAIR TABLE).
+
+The Glue Data Catalog database `entity_resolution_dw` is created by the DDL.
+Confirm it appears in the **AWS Glue console → Databases** tab — if it does, you
+are using Hive-style partitioned external tables backed by the Glue Catalog.
+
+### F. Bootstrap Glue job + Lambda + EventBridge (one-time setup)
+
+```bash
+# Create two IAM roles first (see comments inside the script for exact policies):
+#   GlueS3Role    — AWSGlueServiceRole + S3 read/write on your bucket
+#   LambdaAthenaRole — AWSLambdaBasicExecutionRole + AmazonAthenaFullAccess + S3 read/write
+
+GLUE_ROLE_ARN=arn:aws:iam::123456789012:role/GlueS3Role \
+LAMBDA_ROLE_ARN=arn:aws:iam::123456789012:role/LambdaAthenaRole \
+python deploy/bootstrap_aws_pipeline.py
+```
+
+This creates:
+- **Glue ETL job** `entity-resolution-etl` — PySpark job that re-generates Parquet from raw TSVs
+- **Glue crawler** `entity-resolution-crawler` — refreshes Glue Data Catalog schema/partitions
+- **Lambda function** `entity-resolution-quality-gate` — runs all 5 integrity checks via Athena
+- **EventBridge rule** `entity-resolution-daily-gate` — triggers the Lambda daily at 02:00 UTC
+
+Test the Lambda manually after deployment:
+```bash
+aws lambda invoke --function-name entity-resolution-quality-gate out.json
+cat out.json
+# Expected: {"status": "PASS", "all_passed": true, ...}
+```
+
+### G. (Optional) Redshift Serverless verification
+
+Runs the same two queries on Redshift Serverless so you can compare execution
+time against Athena. Requires the 90-day free trial or credits — check pricing
+before starting and set a billing alarm first.
+
+```bash
+# Create Redshift Serverless workgroup in the console first (8 RPU minimum).
+# Then create an IAM role with s3:GetObject on your bucket and pass its ARN:
+
+REDSHIFT_ROLE_ARN=arn:aws:iam::123456789012:role/RedshiftS3ReadRole \
+python deploy/redshift_verify.py
+
+# Results written to aws_results/redshift_query{1,2}.csv
+# Tear down after:
+aws redshift-serverless delete-workgroup --workgroup-name entity-resolution-wg
+aws redshift-serverless delete-namespace --namespace-name entity-resolution-ns
+```
 
 ---
 
@@ -304,8 +380,10 @@ SELECT
 
 ```
 aws_results/
-  query1_quality_gate.csv          # Athena mutual-exclusivity audit output
-  query2_executive_rollup.csv      # Athena blocking telemetry output
+  query1_quality_gate.csv               # Athena Q1 — mutual-exclusivity audit
+  query2_executive_rollup.csv           # Athena Q2 — blocking telemetry
+  redshift_query1_quality_gate.csv      # Redshift Q1 — generated by redshift_verify.py
+  redshift_query2_executive_rollup.csv  # Redshift Q2 — generated by redshift_verify.py
 
 code/business_entity_resolution/
   src/
@@ -317,7 +395,7 @@ code/business_entity_resolution/
     judge.py                       # Jev-style set-level transformer judge (v10)
     decision.py                    # 1-to-many exclusive assignment + threshold
     assemble_matches_lowmem.py     # Merges per-country checkpoints
-    export_lakehouse.py            # ETL: TSVs -> partitioned Parquet star schema
+    export_lakehouse.py            # Local ETL: TSVs -> partitioned Parquet star schema
   models/
     xgboost_matcher_v10.json       # XGBoost booster (inference-ready)
     judge_v10.pt                   # Jev judge weights (inference-ready)
@@ -329,13 +407,19 @@ sql/
   athena_warehouse_ddl.sql         # CREATE DATABASE, tables, MSCK REPAIR, verification queries
 
 deploy/
-  s3_upload.py                     # boto3 parallel uploader
-  aws_deploy.ps1                   # PowerShell deployment script
+  s3_upload.py                     # boto3 parallel uploader (lakehouse_gold/ -> S3)
+  aws_deploy.ps1                   # PowerShell wrapper for s3_upload.py
+  glue_etl_job.py                  # PySpark Glue job — same ETL as export_lakehouse.py
+  bootstrap_aws_pipeline.py        # Provisions Glue job + crawler + Lambda + EventBridge
+  lambda_quality_gate/
+    handler.py                     # Lambda — runs 5 Athena integrity checks on schedule
+  redshift_verify.py               # Loads gold Parquet into Redshift Serverless; compares
+                                   # query runtime against Athena
 
-output/                            # (git-ignored — generated locally)
+output/                            # (git-ignored — generated locally or by Glue job)
   matching_results.tsv             # Leaderboard submission (1.73 M S1 rows)
   candidate_pairs.tsv              # Blocking candidates (128.7 M pairs)
-  lakehouse_gold/                  # Parquet star schema (generated by export_lakehouse.py)
+  lakehouse_gold/                  # Parquet star schema (4 tables, ~1.06 GB)
 ```
 
 ---
