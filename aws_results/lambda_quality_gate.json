@@ -1,0 +1,21 @@
+{
+  "statusCode": 200,
+  "body": {
+    "status": "PASS",
+    "all_passed": true,
+    "checks": {
+      "mutual_exclusivity": {
+        "passed": true,
+        "rows": [
+          {"country": "France", "total_assigned_targets": "948244", "unique_assigned_targets": "948244", "mutual_exclusivity_violations": "0"},
+          {"country": "India",  "total_assigned_targets": "2523615","unique_assigned_targets": "2523615","mutual_exclusivity_violations": "0"},
+          {"country": "US",     "total_assigned_targets": "2327306", "unique_assigned_targets": "2327306", "mutual_exclusivity_violations": "0"}
+        ]
+      },
+      "s1_row_count":          {"passed": true, "expected": 1732544, "actual": 1732544},
+      "target_row_count":      {"passed": true, "expected": 9969589, "actual": 9969589},
+      "referential_integrity": {"passed": true, "orphan_links": 0},
+      "cross_table_checksum":  {"passed": true, "counts": {"summary_total": "5799165", "links_total": "5799165"}}
+    }
+  }
+}
