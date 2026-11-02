@@ -1,5 +1,8 @@
 # Business Entity Resolution Pipeline — Amazon ML Challenge 2026
 
+> **Deployed:** Hybrid Edge-GPU + AWS Serverless Lakehouse — S3 + Glue + Athena
+> **Macro F0.5:** 0.9645 | **Records:** 11.7M | **Candidate Pairs:** 128.7M | **Search-Space Reduction:** 99.9993% | **Mutual Exclusivity Violations:** 0
+
 This package contains the complete, self-contained, end-to-end reproducible machine learning pipeline for the **Amazon ML Challenge 2026: Business Entity Resolution Challenge**.
 
 ---
@@ -204,3 +207,158 @@ Step 3 writes rows for India only (other countries empty); step 4 replaces the F
 was used for character-bigram signatures in 5 soft-alignment features (now CRC32, with a regression test). Re-running
 these steps with the fixed code gives equivalent, not byte-identical, results; retrain first (step 1) so model and
 features match.
+
+
+---
+
+## AWS Serverless Lakehouse Deployment (Zero-Cost, Free Tier)
+
+### Architectural Motivation: Why AWS Lakehouse (S3 + Glue + Athena)?
+
+A common anti-pattern in ML competitions is leaving multi-gigabyte flat files (`.tsv` / `.csv`) on local disks or raw S3 buckets. In a production enterprise setting (e.g. Amazon Catalog, Fraud, or Search teams), this fails:
+1. **Decoupling GPU Compute from Downstream Serving**: Heavy ML inference requires expensive GPU instances (e.g. CUDA 13, RTX 5070 Ti / AWS G5). Keeping GPU clusters idle just to let business analysts or microservices look up entity matches is wasteful. We run batch inference once, convert predictions to a **Kimball Star Schema**, and serve downstream consumers using serverless SQL at **$0.00 idle cost**.
+2. **Partition Pruning (60%–80% Scan & Latency Reduction)**: Searching a flat 2.8 GB TSV requires a full disk scan every single query. With Hive-partitioned Snappy Parquet (`country=France`, etc.), Athena reads only the target country partition, scanning ~35 MB in **sub-2-second latency** (~$0.00017 per query).
+3. **Automated CI/CD Data Quality Gate**: Model predictions must never be published to master catalogs unchecked. Athena executes an automated **mutual exclusivity audit** SQL check that mathematically confirms zero S2/S3 target records were assigned to multiple S1 canonical entities.
+4. **Enterprise Multi-Tenant Accessibility**: Converted into Kimball dimensions and facts, downstream services (search indexing, vendor risk, BI dashboards in QuickSight/Tableau) can query the canonical entity graph directly via standard JDBC/ODBC/SQL without needing custom Python parsers.
+
+### Architecture: Hybrid Edge-GPU + AWS Data Lakehouse
+
+```
+[Local GPU: 11.7M records, 128.7M candidate pairs, trained models]
+                          |
+                          v  (export_lakehouse.py — ~10 min)
++------------------------------------------------------------------+
+|  KIMBALL STAR SCHEMA — Snappy-compressed Parquet                |
+|  dim_canonical_entity  (1.73M S1 entities, partitioned/country) |
+|  dim_target_record     (9.97M S2+S3 records, part./country)     |
+|  fact_entity_summary   (per-S1 blocking telemetry)              |
+|  fact_resolution_links (5.8M resolved 1-to-many links)          |
++------------------------------------------------------------------+
+                          |
+                          v  (s3_upload.py / aws_deploy.ps1 — ~5 min)
++------------------------------------------------------------------+
+|  AMAZON S3 MEDALLION DATA LAKE  (AWS Free Tier — 5 GB free)     |
+|  s3://riya-entity-lakehouse-2026/lakehouse_gold/                  |
++------------------------------------------------------------------+
+                          |
+                          v  (Athena DDL + MSCK REPAIR — ~5 min)
++------------------------------------------------------------------+
+|  AMAZON ATHENA SERVERLESS DATA WAREHOUSE                         |
+|  Partition pruning: country scoping scans ~60%–80% less data     |
+|  Cost: ~$0.0007/query on 1.06 GB compressed Parquet             |
++------------------------------------------------------------------+
+```
+
+### Verified Metrics & Live Cloud Query Results
+
+All production query outputs are committed directly in [`aws_results/`](aws_results/):
+
+| Metric | Value | Verification Source |
+|---|---|---|
+| Total Records Processed | **11,702,133** (1.73M S1 + 9.97M S2/S3) | Row counts in dim tables |
+| Blocking Search-Space Reduction | **99.9993%** (17.27T → 128.7M pairs) | [`aws_results/query2_executive_rollup.csv`](aws_results/query2_executive_rollup.csv) |
+| Total Resolved Entity Links | **5,799,165** (US: 2.33M, IN: 2.52M, FR: 948K) | [`aws_results/query1_quality_gate.csv`](aws_results/query1_quality_gate.csv) |
+| Storage Compression | **62.7%** reduction (2.83 GB TSV → 1.06 GB Parquet) | Raw TSV vs `lakehouse_gold/` folder size |
+| Mutual Exclusivity Violations | **0** across all 5.8M links | [`aws_results/query1_quality_gate.csv`](aws_results/query1_quality_gate.csv) |
+| Validation Macro F0.5 | **0.9645** (+10.75 pts over baseline 0.857) | Held-out validation split benchmark |
+
+---
+
+### Cloud Warehouse Verification Queries
+
+#### Query 1: Data Quality Gate (Mutual Exclusivity Audit)
+*Result artifact:* [`aws_results/query1_quality_gate.csv`](aws_results/query1_quality_gate.csv)
+```sql
+SELECT
+    country,
+    COUNT(target_id)                             AS total_assigned_targets,
+    COUNT(DISTINCT target_id)                    AS unique_assigned_targets,
+    COUNT(target_id) - COUNT(DISTINCT target_id) AS mutual_exclusivity_violations
+FROM entity_resolution_dw.fact_resolution_links
+GROUP BY country
+ORDER BY country;
+```
+
+**Live Athena Output (`aws_results/query1_quality_gate.csv`):**
+| country | total_assigned_targets | unique_assigned_targets | mutual_exclusivity_violations |
+| :--- | :--- | :--- | :--- |
+| **France** | 948,244 | 948,244 | **0** |
+| **India** | 2,523,615 | 2,523,615 | **0** |
+| **US** | 2,327,306 | 2,327,306 | **0** |
+
+*Verification:* Zero duplicate assignments across all 5,799,165 links; perfect 1-to-many integrity.
+
+#### Query 2: Executive Warehouse Rollup (Telemetry & Singletons)
+*Result artifact:* [`aws_results/query2_executive_rollup.csv`](aws_results/query2_executive_rollup.csv)
+```sql
+SELECT
+    country, model_version,
+    COUNT(entity_id)                                                   AS total_s1_entities,
+    SUM(candidate_count)                                               AS total_blocking_pairs,
+    ROUND(AVG(CAST(candidate_count AS DOUBLE)), 2)                     AS avg_candidates_per_entity,
+    SUM(matched_target_count)                                          AS total_resolved_matches,
+    ROUND(100.0 * SUM(CASE WHEN is_singleton THEN 1 ELSE 0 END)
+                / NULLIF(COUNT(entity_id), 0), 2)                      AS singleton_rate_pct
+FROM entity_resolution_dw.fact_entity_summary
+GROUP BY country, model_version
+ORDER BY total_s1_entities DESC;
+```
+
+**Live Athena Output (`aws_results/query2_executive_rollup.csv`):**
+| country | model_version | total_s1_entities | total_blocking_pairs | avg_candidates_per_entity | total_resolved_matches | singleton_rate_pct |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **India** | `v9_semantic_xgb` | 809,986 | 64,453,235 | 79.57 | 2,523,615 | 6.57% |
+| **US** | `v10_jev_judge` | 663,106 | 41,379,932 | 62.40 | 2,327,306 | 6.13% |
+| **France** | `v10_jev_judge` | 259,452 | 22,877,895 | 88.18 | 948,244 | 5.09% |
+
+---
+
+### Step-by-Step Reproduction Guide
+
+#### Step 1: Build the Star Schema Parquet (Local, ~10 min)
+```bash
+cd code/business_entity_resolution/src
+python export_lakehouse.py
+# Generates output/lakehouse_gold/ (1.06 GB, 4 tables, 3 country partitions each)
+```
+
+#### Step 2: Configure AWS & Upload to S3 (~5 min)
+```bash
+# Configure credentials:
+aws configure   # region: ap-south-1
+
+# PowerShell (Windows) or Python boto3:
+python deploy/s3_upload.py
+# Or: .\deploy\aws_deploy.ps1
+```
+
+#### Step 3: Register Tables in Amazon Athena (~5 min)
+1. Open the [Amazon Athena Console](https://ap-south-1.console.aws.amazon.com/athena/home?region=ap-south-1).
+2. Set query result location to `s3://riya-entity-lakehouse-2026/athena-results/`.
+3. Execute `sql/athena_warehouse_ddl.sql` to register the database and all 4 tables with partition discovery (`MSCK REPAIR`).
+
+---
+
+### Repo Layout (AWS Additions)
+
+```
+aws_results/
+  query1_quality_gate.csv     # Athena Data Quality Gate output (0 violations)
+  query2_executive_rollup.csv # Athena Executive Rollup output (blocking & singletons)
+code/business_entity_resolution/src/
+  export_lakehouse.py         # ETL: TSVs -> Partitioned Kimball Parquet
+sql/
+  athena_warehouse_ddl.sql    # Athena DDL + verification analytical queries
+deploy/
+  s3_upload.py                # Direct boto3 parallel S3 uploader
+  aws_deploy.sh               # Bash deployment script
+  aws_deploy.ps1              # PowerShell deployment script
+output/
+  matching_results.tsv        # Raw leaderboard submission (1.73M S1 rows)
+  candidate_pairs.tsv         # Blocking candidates (128.7M pairs)
+  lakehouse_gold/             # Parquet Star Schema (generated by export_lakehouse.py)
+    dim_canonical_entity/     # 311.7 MB Snappy Parquet, partitioned by country
+    dim_target_record/        # 641.6 MB Snappy Parquet, partitioned by country
+    fact_entity_summary/      #  20.3 MB Snappy Parquet, partitioned by country
+    fact_resolution_links/    #  84.3 MB Snappy Parquet, partitioned by country
+```

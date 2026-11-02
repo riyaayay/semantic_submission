@@ -1,0 +1,5 @@
+
+# Ignore all outputs and datasets (data lives in S3, not git)
+dataset/
+output.zip
+output/
