@@ -29,7 +29,7 @@ Usage
     LAMBDA_ROLE_ARN=arn:aws:iam::123:role/LambdaRole \
     python deploy/bootstrap_aws_pipeline.py
 
-Cost notes (ap-south-1 pricing at time of writing)
+Cost notes (ap-southeast-2 pricing at time of writing)
 ---------------------------------------------------
 Service              Free tier?   Estimated cost for this project
 -------------------  ----------   -------------------------------------------
@@ -57,7 +57,7 @@ from botocore.exceptions import ClientError
 # Config — override via environment variables
 # --------------------------------------------------------------------------- #
 BUCKET           = os.environ.get("BUCKET",            "riya-entity-lakehouse-2026")
-REGION           = os.environ.get("AWS_DEFAULT_REGION","ap-south-1")
+REGION           = os.environ.get("AWS_DEFAULT_REGION","ap-southeast-2")
 GLUE_ROLE_ARN    = os.environ.get("GLUE_ROLE_ARN",    "")   # required
 LAMBDA_ROLE_ARN  = os.environ.get("LAMBDA_ROLE_ARN",  "")   # required
 

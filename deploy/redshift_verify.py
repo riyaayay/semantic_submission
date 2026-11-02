@@ -78,7 +78,7 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 # Redshift Data API helpers
 # --------------------------------------------------------------------------- #
 def _client():
-    return boto3.client("redshift-data", region_name=os.environ.get("AWS_DEFAULT_REGION", "ap-south-1"))
+    return boto3.client("redshift-data", region_name=os.environ.get("AWS_DEFAULT_REGION", "ap-southeast-2"))
 
 
 def run_sql(client, sql: str, label: str = "") -> dict:
