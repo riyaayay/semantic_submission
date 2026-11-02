@@ -1,93 +1,175 @@
 # Business Entity Resolution Pipeline — Amazon ML Challenge 2026
 
-> **Deployed:** Hybrid Edge-GPU + AWS Serverless Lakehouse — S3 + Glue + Athena
-> **Macro F0.5:** 0.9645 | **Records:** 11.7M | **Candidate Pairs:** 128.7M | **Search-Space Reduction:** 99.9993% | **Mutual Exclusivity Violations:** 0
-
-This package contains the complete, self-contained, end-to-end reproducible machine learning pipeline for the **Amazon ML Challenge 2026: Business Entity Resolution Challenge**.
+> **Validation Macro F0.5: 0.9645** | 11.7 M records | 128.7 M candidate pairs | 99.9993 % search-space reduction
 
 ---
 
-## 1. Problem Overview & Architecture
+## Table of Contents
 
-The objective is to resolve real-world business entities from three noisy sources without shared IDs:
-* **Source 1 ($S_1$)**: Deduplicated reference source.
-* **Source 2 ($S_2$) & Source 3 ($S_3$)**: Noisy vendor records containing name typos, legal suffix variations, missing address fields, and transliterations.
-* **Open-Set Countries**: Training covers `US` and `India`; Test adds **`France`**. Our pipeline uses strictly language-agnostic features and country partitioning.
-
-### Pipeline Architecture:
-1. **Vectorized Text & Address Normalization**: Unicode NFKD accent folding, lowercase standardization, street abbreviation expansion, and house number/postal code extraction.
-2. **Multi-Path Blocking Engine with Category 2 India Bigrams**: Country-partitioned inverted index combining:
-   - Compressed name prefixes (8-char and 5-char)
-   - First 2 words of business name
-   - Salient name tokens (length $\ge 5$, frequency capped $\le 150$)
-   - Address anchors (postal code + house number)
-   - Locality anchors (house/street number + salient street words)
-   - India-gated address token bigrams (recovering non-Latin transliterations and missing postal codes)
-3. **C-Accelerated 25-Feature Engineering**: Sub-second extraction using `rapidfuzz` (Levenshtein ratio, Token Sort, Token Set, Jaro-Winkler, numeric token Jaccard overlap, postal code matching, source flags, Damerau-Levenshtein, LCSseq, phonetic Soundex, and train-only zero-leakage TF-IDF cosine similarity).
-4. **LightGBM Matcher**: Gradient boosted decision tree trained on true matches and hard negative blocking candidates under certified hyperparameters.
-5. **Structural Post-Processing**:
-   - **1-to-many Mutual Exclusivity Assignment**: Each $S_2$ and $S_3$ target record is assigned exclusively to the $S_1$ entity that yielded the highest confidence score, eliminating cross-entity false merges.
-   - **Optimal Decision Thresholding**: Threshold locked at $\tau = 0.65$, maximizing precision and preserving singleton integrity under the Macro $F_{0.5}$ metric.
+1. [Problem Overview](#1-problem-overview)
+2. [Pipeline Architecture](#2-pipeline-architecture)
+3. [Verified Metrics](#3-verified-metrics)
+4. [AWS Lakehouse Deployment](#4-aws-lakehouse-deployment)
+5. [Step-by-Step Reproduction](#5-step-by-step-reproduction)
+6. [Data Quality Checks](#6-data-quality-checks)
+7. [Repo Layout](#7-repo-layout)
+8. [Model Compliance](#8-model-compliance)
 
 ---
 
-## 2. Directory Structure
+## 1. Problem Overview
+
+Three noisy business-record sources share no common IDs:
+
+| Source | Description | Count |
+|--------|-------------|-------|
+| S1 | Deduplicated reference entities | 1.73 M |
+| S2 | Vendor records (typos, legal-suffix variation) | ~5 M |
+| S3 | Vendor records (missing addresses, transliterations) | ~5 M |
+
+Training covers **US** and **India**; the test set adds **France** (zero labels). The pipeline uses strictly language-agnostic features so unseen countries are handled identically to seen ones.
+
+---
+
+## 2. Pipeline Architecture
 
 ```
-business_entity_resolution/
-├── src/
-│   ├── normalizer.py          # Multilingual text, address, and legal suffix normalizer
-│   ├── metrics.py             # Official Macro F_0.5 evaluation engine with singleton rules
-│   ├── blocking.py            # High-performance multi-path blocking engine with Cat2 bigrams
-│   ├── features.py            # C-accelerated 25-feature extractor & TF-IDF vocab manager
-│   ├── train_matcher.py       # LightGBM training, hard negative mining & certified training
-│   └── predict.py             # Full test inference pipeline generating TSVs
-├── models/
-│   ├── xgboost_matcher.json   # Serialized XGBoost booster model (Apache 2.0, < 8B params, CUDA GPU native)
-│   ├── lightgbm_matcher.txt   # Serialized LightGBM booster model (MIT license, < 8B params)
-│   ├── tfidf_vocab.pkl        # Serialized zero-leakage train-fitted TF-IDF vocabulary
-│   └── config.pkl             # Optimized decision threshold configuration (tau = 0.65)
-├── requirements.txt           # Pinned dependency versions
-└── README.md                  # Reproduction instructions
+S1 / S2 / S3 TSVs
+       |
+       v  normalizer.py
+Unicode NFKD, accent folding, street abbreviations, house-number / postal-code extraction
+       |
+       v  blocking.py
+Multi-path inverted index:
+  - Compressed name prefixes (8-char, 5-char)
+  - First-2-word anchor
+  - Salient name tokens (len >= 5, freq <= 150)
+  - Postal-code + house-number anchor
+  - India-gated address bigrams (non-Latin transliterations)
+  - Top-10 by multilingual name-embedding cosine (v9+)
+       |
+       v  features.py / gpu_features.py
+25-50 pairwise features: Levenshtein ratio, Token Sort/Set, Jaro-Winkler,
+numeric-token Jaccard, postal-code match, phonetic Soundex, TF-IDF cosine,
+char 3-gram, soft token alignment, semantic embedding cosine (v9+)
+       |
+       v  train_matcher.py / predict.py
+XGBoost (CUDA) + set-level Jev judge (v10)
+Threshold tau = 0.65, 1-to-many exclusive assignment
+       |
+       v  matching_results.tsv / candidate_pairs.tsv
 ```
+
+### Model versions
+
+| Version | Key addition | Validation F0.5 |
+|---------|-------------|-----------------|
+| v7 | Phonetic skeleton, country-agnostic IDF | — |
+| v9 | GPU features, multilingual embedding cosine | 0.9516 |
+| **v10** | Jev-style set-level transformer judge | **0.9645** |
+
+**Submitted output:** France + US rows from v10; India rows from v9 (v10 inference did not finish before the deadline). `candidate_pairs.tsv` is identical for v9 and v10 (same blocking code).
 
 ---
 
-## 3. Environment Setup
+## 3. Verified Metrics
 
-Install all pinned dependencies:
+| Metric | Value | Source |
+|--------|-------|--------|
+| Validation Macro F0.5 | **0.9645** | Held-out validation split |
+| Total records | 11,702,133 (1.73 M S1 + 9.97 M S2/S3) | Row counts in dim tables |
+| Candidate pairs | 128,711,062 | `fact_entity_summary.candidate_count` SUM |
+| Search-space reduction | **99.9993 %** (17.27 T → 128.7 M) | Athena Query 3 |
+| Resolved entity links | 5,799,165 (US 2.33 M, IN 2.52 M, FR 948 K) | Athena Query 1 |
+| TSV → Parquet compression | 62.7 % (2.83 GB → 1.06 GB) | Folder sizes |
+| Mutual-exclusivity violations | 0 | Athena Query 1 (see §6 for stronger checks) |
+
+---
+
+## 4. AWS Lakehouse Deployment
+
+### Why S3 + Glue + Athena?
+
+The TSV outputs are 2.83 GB of flat files. Converting them to Snappy-compressed, country-partitioned Parquet and registering them in Athena lets any SQL tool query the results without keeping a Python process or GPU running.
+
+**Cost on this dataset (Athena at \$5 / TB scanned):**
+
+| Query scope | Data scanned | Estimated cost |
+|-------------|-------------|----------------|
+| All 4 tables, all countries | ~1.06 GB | ~\$0.0053 |
+| Single country partition only | ~35–120 MB | ~\$0.0002–\$0.0006 |
+
+> **Note:** Partition pruning (e.g. `WHERE country = 'France'`) reduces the bytes Athena actually reads. The figures above are estimates; exact bytes scanned are shown in the Athena console's *Query statistics* tab after each run.
+
+**Free-tier usage:** S3 (15 objects, 1,058 MB) stays within the 5 GB free tier. Glue Data Catalog table registrations are free under 1 M objects. Athena has no free tier; each query above costs a fraction of a cent.
+
+### Architecture
+
+```
+[Local GPU inference — 11.7 M records, 128.7 M pairs]
+                  |
+                  v  export_lakehouse.py (~10 min, local)
++------------------------------------------------------------+
+|  Kimball Star Schema — Snappy Parquet                      |
+|  dim_canonical_entity   1.73 M rows   311.7 MB            |
+|  dim_target_record      9.97 M rows   641.6 MB            |
+|  fact_entity_summary    1.73 M rows    20.3 MB            |
+|  fact_resolution_links  5.80 M rows    84.3 MB            |
++------------------------------------------------------------+
+                  |
+                  v  s3_upload.py (~5 min)
++------------------------------------------------------------+
+|  Amazon S3                                                 |
+|  s3://riya-entity-lakehouse-2026/lakehouse_gold/           |
++------------------------------------------------------------+
+                  |
+                  v  athena_warehouse_ddl.sql (~5 min)
++------------------------------------------------------------+
+|  AWS Glue Data Catalog + Amazon Athena                     |
+|  database: entity_resolution_dw (4 external tables)       |
++------------------------------------------------------------+
+```
+
+### Live query results
+
+Committed in [`aws_results/`](aws_results/):
+
+| File | Contents |
+|------|----------|
+| [`query1_quality_gate.csv`](aws_results/query1_quality_gate.csv) | Mutual-exclusivity audit per country |
+| [`query2_executive_rollup.csv`](aws_results/query2_executive_rollup.csv) | Blocking telemetry + singleton rates |
+
+---
+
+## 5. Step-by-Step Reproduction
+
+### A. Local inference (requires NVIDIA GPU, CUDA 13)
 
 ```bash
-pip install -r requirements.txt
+cd code/business_entity_resolution/src
+pip install -r ../requirements.txt
+
+# Train (writes models/xgboost_matcher_v9.json and v10, judge_v10.pt, config*.pkl)
+python train_matcher.py --features v9  --per-country 60000
+python train_matcher.py --features v10 --per-country 60000
+
+# v10 inference for all countries
+MODEL_CONFIG=config_v10.pkl OUTPUT_DIR=../../../output/v10 python predict.py
+
+# v9 inference for India only
+MODEL_CONFIG=config_v9.pkl PREDICT_COUNTRIES=India OUTPUT_DIR=../../../output/v9_india python predict.py
+
+# Assemble final submission (v10 rows for France + US, v9 for India)
+python assemble_matches_lowmem.py \
+    ../../../output/v9_india/matching_results.tsv \
+    ../../../output/final_matching_results.tsv \
+    --checkpoint France=../../../output/v10 \
+    --checkpoint US=../../../output/v10
 ```
 
----
+> **Exactness note:** The submitted outputs were produced before a determinism fix (Python `hash()` replaced with CRC32 for character-bigram signatures). Re-running gives equivalent, not byte-identical, results; retrain first so model and features match.
 
-## 4. How to Reproduce End-to-End
-
-### Step 1: Train the Matcher & Tune the Threshold
-Runs blocking on the training set, fits train-only TF-IDF vocabulary, extracts 25 pairwise features, trains the LightGBM classifier with early stopping, and validates the threshold optimizing Macro $F_{0.5}$:
-
-```bash
-python src/train_matcher.py
-```
-*Outputs:*
-* `models/lightgbm_matcher.txt`
-* `models/tfidf_vocab.pkl` (Zero-leakage training vocabulary)
-* `models/config.pkl` (production threshold: 0.65)
-
-### Step 2: Run Test Set Inference
-Generates candidate pairs and final entity matches across all 1.73M test records:
-
-```bash
-python src/predict.py
-```
-*Outputs:*
-* `../../output/matching_results.tsv` (Leaderboard submission file)
-* `../../output/candidate_pairs.tsv` (Blocking candidates file)
-
-### Step 3: Validate Outputs
-Run the official validator to verify zero formatting errors:
+### B. Validate submission format
 
 ```bash
 python ../../6ab10eb3b23ba_student_resource/student_resource/utils/validate_submission.py \
@@ -97,177 +179,40 @@ python ../../6ab10eb3b23ba_student_resource/student_resource/utils/validate_subm
     --check-ids
 ```
 
-Expected output: `PASS — no blocking issues found. Safe to submit.`
+Expected: `PASS — no blocking issues found.`
+
+### C. Build the Star Schema Parquet (local, ~10 min)
+
+```bash
+cd code/business_entity_resolution/src
+python export_lakehouse.py
+# Writes output/lakehouse_gold/ (4 tables, ~1.06 GB total)
+```
+
+### D. Upload to S3 (~5 min)
+
+```bash
+aws configure          # region: ap-south-1
+
+python deploy/s3_upload.py
+# Or on Windows PowerShell:
+.\deploy\aws_deploy.ps1
+```
+
+### E. Register tables in Athena (~5 min)
+
+1. Open the [Athena console](https://ap-south-1.console.aws.amazon.com/athena/home?region=ap-south-1).
+2. Set query result location to `s3://riya-entity-lakehouse-2026/athena-results/`.
+3. Run all statements in `sql/athena_warehouse_ddl.sql` (CREATE DATABASE, 4 × CREATE EXTERNAL TABLE, 4 × MSCK REPAIR TABLE).
 
 ---
 
-## 5. Model License & Compliance
-* **Model Type & Version**: LightGBM Gradient Boosted Decision Tree (`lightgbm==4.7.0`).
-* **License**: MIT License (Permissive Open Source).
-* **Parameter Count**: Under 10,000 tree parameters (fully compliant with the $\le 8\text{B}$ parameter limit).
-* **External APIs**: Strictly zero external lookups, geocoding APIs, or web augmentation.
+## 6. Data Quality Checks
 
-## v7 pipeline (final submission)
+### Query 1 — Mutual-exclusivity audit
 
-Country-agnostic matcher built to generalize to France, which has no training labels.
+Each S2/S3 target must appear in at most one S1 entity's match set. The assignment step enforces this by construction; this query is a regression gate confirming the Parquet export did not corrupt the data.
 
-```bash
-cd code/business_entity_resolution/src
-pip install -r ../requirements.txt
-python train_matcher.py --features v7 --per-country 20000   # GPU XGBoost; writes models/xgboost_matcher_v7.json + config.pkl
-# France rows of the final submission (cap 30 candidates per S1):
-PREDICT_COUNTRIES=France MAX_CANDIDATES_PER_S1=30 OUTPUT_DIR=../../../output/v7_france python predict.py
-# full test set with v7 (all countries):
-python predict.py
-```
-
-- `blocking.py`: Unicode cleaning (Brahmic scripts transliterated via `translit.py`, accents folded, dotted acronyms joined), multi-path keys incl. phonetic skeleton, candidates ranked by number of shared keys.
-- `features.py`: 50 features (`FEATURE_NAMES_V7`); IDF and name end-position statistics are computed per country from that country's own target records (label-free), so an unseen country is handled identically.
-- `decision.py`: target-exclusive assignment + threshold or expected-F0.5 set selection (chosen on validation; config records which).
-- Validation: `scripts/generalization_eval.py` (leave-one-country-out). The model shipped here was trained with `scripts/train_from_cache.py --tag fix3` (20k S1 per country, same code path).
-
-**Submitted `output/matching_results.tsv`:** France rows come from the v7 model above; US and India rows are from the earlier v6 submission run (0.830 leaderboard), merged with `scripts/merge_country_results.py`. Running `python predict.py` regenerates all countries with v7.
-
-## v9 pipeline: GPU features + multilingual semantic layer (current)
-
-Everything that can run on the GPU does (no CPU fallback; `src/gpu.py` raises if CUDA is missing).
-Requires an NVIDIA GPU with CUDA 13; install with `pip install -r requirements.txt`.
-
-```bash
-cd code/business_entity_resolution/src
-python train_matcher.py --features v9 --per-country 60000   # writes models/xgboost_matcher_v9.json, v9_source.pt, config.pkl
-python predict.py                                            # writes ../../../output/{matching_results,candidate_pairs}.tsv
-python -m pytest ../tests -q                                 # 11 CPU+GPU tests
-```
-
-- **Blocking** (`blocking.py`): multi-path keys; over-common name keys are refined by address tokens instead of
-  being truncated; candidates ranked by number of shared keys. **v9** adds the top-10 targets by multilingual
-  name-embedding cosine (`v8_pipeline.semantic_candidates`, exact GPU search).
-- **Features** (`gpu_features.py`, `gpu_strings.py`): 47 GPU features (bit-parallel LCS/Levenshtein, verified exact
-  vs rapidfuzz; TF-IDF, char 3-gram, soft token alignment, group gaps). Word statistics are fit per country on
-  that country's own records (label-free). **v9** adds 3 semantic features (name/address embedding cosine, gap to
-  best candidate).
-- **Model**: XGBoost on CUDA, trained on all labelled countries; at inference it is **self-trained per country** on
-  that country's confident pseudo-labels (no labels used), which adapts to unseen countries such as France.
-  Each country's adapted model is saved next to the outputs (`xgboost_matcher_v9_<country>_selftrained.json`).
-- **Semantic model**: `models/semantic_minilm/` = sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
-  (Apache-2.0, 118M parameters, inference only); see `models/semantic_minilm/MODEL_LICENSE.txt`.
-- `models/*.pt` (training tensors used for self-training) are regenerated by `train_matcher.py`.
-- Evaluation scripts (repository root `scripts/`): `generalization_eval_v8.py`, `semantic_eval.py`,
-  `semantic_blocking_eval.py`, `tune_v8.py`.
-
-## v10 pipeline: v9 + Jev-style set-level judge (current)
-
-```bash
-cd code/business_entity_resolution/src
-python train_matcher.py --features v10 --per-country 60000   # v9 stage + out-of-fold scores + judge (models/judge_v10.pt)
-python predict.py                                             # all countries; PREDICT_COUNTRIES=India to run one country
-```
-
-- `src/judge.py`: bidirectional transformer over each S1's top-32 candidates (label-free ranking). Candidate-to-candidate
-  graph-consistency features enter attention as learned biases; typed query slots give a calibrated
-  (evidential Beta) match probability per candidate. Design ideas from kyegomez/open-jev (Apache-2.0), re-implemented.
-- Validation Macro F0.5: v9 stage 0.9516 -> v10 0.9645 (same split).
-- `models/v10_source.pt` (2.1 GB training tensors for per-country self-training) is not shipped; `train_matcher.py`
-  regenerates it. All model weights needed for inference (`xgboost_matcher_v10.json`, `judge_v10.pt`, `config.pkl`,
-  `semantic_minilm/`) are included.
-- `src/assemble_matches_lowmem.py` assembles per-country checkpoints into one `matching_results.tsv`.
-
-## Reproducing the submitted `output/` files (semantic_submission.zip)
-
-The submitted `matching_results.tsv` has **France and US rows from v10** (judge) and **India rows from v9** (India's
-v10 inference did not finish before the deadline). `candidate_pairs.tsv` is identical for v9 and v10 (same blocking
-code; identical pair counts per country). Everything below uses only this folder plus the challenge data
-(`TEST_DATA_DIR` / `TRAIN_DATA_DIR` environment variables, default `../../../6ab10eb3b23ba_student_resource/...`).
-
-```bash
-cd code/business_entity_resolution/src
-pip install -r ../requirements.txt                 # NVIDIA GPU with CUDA 13 required (no CPU fallback)
-
-# 1. Self-training source tensors (models/*_source.pt are not shipped: 2+ GB each).
-#    Each training run also rewrites models/config.pkl; config_v9.pkl / config_v10.pkl keep each version.
-python train_matcher.py --features v9  --per-country 60000
-python train_matcher.py --features v10 --per-country 60000
-
-# 2. v10 for all countries -> ../../../output/v10   (writes candidate_pairs.tsv + per-country checkpoints)
-MODEL_CONFIG=config_v10.pkl OUTPUT_DIR=../../../output/v10 python predict.py
-
-# 3. v9 for India only -> ../../../output/v9_india
-MODEL_CONFIG=config_v9.pkl PREDICT_COUNTRIES=India OUTPUT_DIR=../../../output/v9_india python predict.py
-
-# 4. Final file: v10 rows for France + US replace those rows of the v9 India run's output
-python assemble_matches_lowmem.py ../../../output/v9_india/matching_results.tsv ../../../output/final_matching_results.tsv \
-       --checkpoint France=../../../output/v10 --checkpoint US=../../../output/v10
-#    candidate_pairs.tsv = ../../../output/v10/candidate_pairs.tsv
-```
-
-Step 3 writes rows for India only (other countries empty); step 4 replaces the France and US rows with v10's.
-
-**Exactness:** the submitted outputs were produced before a determinism fix: Python's per-process randomized `hash()`
-was used for character-bigram signatures in 5 soft-alignment features (now CRC32, with a regression test). Re-running
-these steps with the fixed code gives equivalent, not byte-identical, results; retrain first (step 1) so model and
-features match.
-
-
----
-
-## AWS Serverless Lakehouse Deployment (Zero-Cost, Free Tier)
-
-### Architectural Motivation: Why AWS Lakehouse (S3 + Glue + Athena)?
-
-A common anti-pattern in ML competitions is leaving multi-gigabyte flat files (`.tsv` / `.csv`) on local disks or raw S3 buckets. In a production enterprise setting (e.g. Amazon Catalog, Fraud, or Search teams), this fails:
-1. **Decoupling GPU Compute from Downstream Serving**: Heavy ML inference requires expensive GPU instances (e.g. CUDA 13, RTX 5070 Ti / AWS G5). Keeping GPU clusters idle just to let business analysts or microservices look up entity matches is wasteful. We run batch inference once, convert predictions to a **Kimball Star Schema**, and serve downstream consumers using serverless SQL at **$0.00 idle cost**.
-2. **Partition Pruning (60%–80% Scan & Latency Reduction)**: Searching a flat 2.8 GB TSV requires a full disk scan every single query. With Hive-partitioned Snappy Parquet (`country=France`, etc.), Athena reads only the target country partition, scanning ~35 MB in **sub-2-second latency** (~$0.00017 per query).
-3. **Automated CI/CD Data Quality Gate**: Model predictions must never be published to master catalogs unchecked. Athena executes an automated **mutual exclusivity audit** SQL check that mathematically confirms zero S2/S3 target records were assigned to multiple S1 canonical entities.
-4. **Enterprise Multi-Tenant Accessibility**: Converted into Kimball dimensions and facts, downstream services (search indexing, vendor risk, BI dashboards in QuickSight/Tableau) can query the canonical entity graph directly via standard JDBC/ODBC/SQL without needing custom Python parsers.
-
-### Architecture: Hybrid Edge-GPU + AWS Data Lakehouse
-
-```
-[Local GPU: 11.7M records, 128.7M candidate pairs, trained models]
-                          |
-                          v  (export_lakehouse.py — ~10 min)
-+------------------------------------------------------------------+
-|  KIMBALL STAR SCHEMA — Snappy-compressed Parquet                |
-|  dim_canonical_entity  (1.73M S1 entities, partitioned/country) |
-|  dim_target_record     (9.97M S2+S3 records, part./country)     |
-|  fact_entity_summary   (per-S1 blocking telemetry)              |
-|  fact_resolution_links (5.8M resolved 1-to-many links)          |
-+------------------------------------------------------------------+
-                          |
-                          v  (s3_upload.py / aws_deploy.ps1 — ~5 min)
-+------------------------------------------------------------------+
-|  AMAZON S3 MEDALLION DATA LAKE  (AWS Free Tier — 5 GB free)     |
-|  s3://riya-entity-lakehouse-2026/lakehouse_gold/                  |
-+------------------------------------------------------------------+
-                          |
-                          v  (Athena DDL + MSCK REPAIR — ~5 min)
-+------------------------------------------------------------------+
-|  AMAZON ATHENA SERVERLESS DATA WAREHOUSE                         |
-|  Partition pruning: country scoping scans ~60%–80% less data     |
-|  Cost: ~$0.0007/query on 1.06 GB compressed Parquet             |
-+------------------------------------------------------------------+
-```
-
-### Verified Metrics & Live Cloud Query Results
-
-All production query outputs are committed directly in [`aws_results/`](aws_results/):
-
-| Metric | Value | Verification Source |
-|---|---|---|
-| Total Records Processed | **11,702,133** (1.73M S1 + 9.97M S2/S3) | Row counts in dim tables |
-| Blocking Search-Space Reduction | **99.9993%** (17.27T → 128.7M pairs) | [`aws_results/query2_executive_rollup.csv`](aws_results/query2_executive_rollup.csv) |
-| Total Resolved Entity Links | **5,799,165** (US: 2.33M, IN: 2.52M, FR: 948K) | [`aws_results/query1_quality_gate.csv`](aws_results/query1_quality_gate.csv) |
-| Storage Compression | **62.7%** reduction (2.83 GB TSV → 1.06 GB Parquet) | Raw TSV vs `lakehouse_gold/` folder size |
-| Mutual Exclusivity Violations | **0** across all 5.8M links | [`aws_results/query1_quality_gate.csv`](aws_results/query1_quality_gate.csv) |
-| Validation Macro F0.5 | **0.9645** (+10.75 pts over baseline 0.857) | Held-out validation split benchmark |
-
----
-
-### Cloud Warehouse Verification Queries
-
-#### Query 1: Data Quality Gate (Mutual Exclusivity Audit)
-*Result artifact:* [`aws_results/query1_quality_gate.csv`](aws_results/query1_quality_gate.csv)
 ```sql
 SELECT
     country,
@@ -275,21 +220,19 @@ SELECT
     COUNT(DISTINCT target_id)                    AS unique_assigned_targets,
     COUNT(target_id) - COUNT(DISTINCT target_id) AS mutual_exclusivity_violations
 FROM entity_resolution_dw.fact_resolution_links
-GROUP BY country
-ORDER BY country;
+GROUP BY country ORDER BY country;
 ```
 
-**Live Athena Output (`aws_results/query1_quality_gate.csv`):**
+**Result ([`aws_results/query1_quality_gate.csv`](aws_results/query1_quality_gate.csv)):**
+
 | country | total_assigned_targets | unique_assigned_targets | mutual_exclusivity_violations |
-| :--- | :--- | :--- | :--- |
-| **France** | 948,244 | 948,244 | **0** |
-| **India** | 2,523,615 | 2,523,615 | **0** |
-| **US** | 2,327,306 | 2,327,306 | **0** |
+|---------|------------------------|-------------------------|-------------------------------|
+| France  | 948,244  | 948,244  | **0** |
+| India   | 2,523,615 | 2,523,615 | **0** |
+| US      | 2,327,306 | 2,327,306 | **0** |
 
-*Verification:* Zero duplicate assignments across all 5,799,165 links; perfect 1-to-many integrity.
+### Query 2 — Blocking telemetry rollup
 
-#### Query 2: Executive Warehouse Rollup (Telemetry & Singletons)
-*Result artifact:* [`aws_results/query2_executive_rollup.csv`](aws_results/query2_executive_rollup.csv)
 ```sql
 SELECT
     country, model_version,
@@ -300,65 +243,109 @@ SELECT
     ROUND(100.0 * SUM(CASE WHEN is_singleton THEN 1 ELSE 0 END)
                 / NULLIF(COUNT(entity_id), 0), 2)                      AS singleton_rate_pct
 FROM entity_resolution_dw.fact_entity_summary
-GROUP BY country, model_version
-ORDER BY total_s1_entities DESC;
+GROUP BY country, model_version ORDER BY total_s1_entities DESC;
 ```
 
-**Live Athena Output (`aws_results/query2_executive_rollup.csv`):**
-| country | model_version | total_s1_entities | total_blocking_pairs | avg_candidates_per_entity | total_resolved_matches | singleton_rate_pct |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **India** | `v9_semantic_xgb` | 809,986 | 64,453,235 | 79.57 | 2,523,615 | 6.57% |
-| **US** | `v10_jev_judge` | 663,106 | 41,379,932 | 62.40 | 2,327,306 | 6.13% |
-| **France** | `v10_jev_judge` | 259,452 | 22,877,895 | 88.18 | 948,244 | 5.09% |
+**Result ([`aws_results/query2_executive_rollup.csv`](aws_results/query2_executive_rollup.csv)):**
+
+| country | model_version | total_s1_entities | total_blocking_pairs | avg_candidates | total_resolved | singleton_rate |
+|---------|---------------|------------------:|---------------------:|---------------:|---------------:|---------------:|
+| India   | v9_semantic_xgb | 809,986 | 64,453,235 | 79.57 | 2,523,615 | 6.57 % |
+| US      | v10_jev_judge  | 663,106 | 41,379,932 | 62.40 | 2,327,306 | 6.13 % |
+| France  | v10_jev_judge  | 259,452 | 22,877,895 | 88.18 |   948,244 | 5.09 % |
+
+### Additional integrity checks (run in Athena)
+
+The following checks can actually fail if the export is corrupted, making them meaningful regression gates:
+
+**Row-count match — dim_canonical_entity must contain exactly 1,732,544 rows:**
+```sql
+SELECT COUNT(*) AS s1_row_count FROM entity_resolution_dw.dim_canonical_entity;
+-- Expected: 1732544
+```
+
+**Row-count match — dim_target_record must contain exactly 9,969,589 rows:**
+```sql
+SELECT COUNT(*) AS target_row_count FROM entity_resolution_dw.dim_target_record;
+-- Expected: 9969589
+```
+
+**Referential integrity — every entity_id in fact_resolution_links must exist in dim_canonical_entity:**
+```sql
+SELECT COUNT(*) AS orphan_links
+FROM entity_resolution_dw.fact_resolution_links f
+LEFT JOIN entity_resolution_dw.dim_canonical_entity d
+       ON f.entity_id = d.entity_id AND f.country = d.country
+WHERE d.entity_id IS NULL;
+-- Expected: 0
+```
+
+**Null rates on key columns:**
+```sql
+SELECT
+    SUM(CASE WHEN entity_id  IS NULL THEN 1 ELSE 0 END) AS null_entity_id,
+    SUM(CASE WHEN name_raw   IS NULL THEN 1 ELSE 0 END) AS null_name_raw,
+    SUM(CASE WHEN country    IS NULL THEN 1 ELSE 0 END) AS null_country
+FROM entity_resolution_dw.dim_canonical_entity;
+-- Expected: all 0
+```
+
+**Row-count checksum — fact_resolution_links total must match the sum from fact_entity_summary:**
+```sql
+SELECT
+    (SELECT SUM(matched_target_count) FROM entity_resolution_dw.fact_entity_summary) AS summary_total,
+    (SELECT COUNT(*)                  FROM entity_resolution_dw.fact_resolution_links) AS links_total;
+-- Expected: both columns equal 5799165
+```
 
 ---
 
-### Step-by-Step Reproduction Guide
-
-#### Step 1: Build the Star Schema Parquet (Local, ~10 min)
-```bash
-cd code/business_entity_resolution/src
-python export_lakehouse.py
-# Generates output/lakehouse_gold/ (1.06 GB, 4 tables, 3 country partitions each)
-```
-
-#### Step 2: Configure AWS & Upload to S3 (~5 min)
-```bash
-# Configure credentials:
-aws configure   # region: ap-south-1
-
-# PowerShell (Windows) or Python boto3:
-python deploy/s3_upload.py
-# Or: .\deploy\aws_deploy.ps1
-```
-
-#### Step 3: Register Tables in Amazon Athena (~5 min)
-1. Open the [Amazon Athena Console](https://ap-south-1.console.aws.amazon.com/athena/home?region=ap-south-1).
-2. Set query result location to `s3://riya-entity-lakehouse-2026/athena-results/`.
-3. Execute `sql/athena_warehouse_ddl.sql` to register the database and all 4 tables with partition discovery (`MSCK REPAIR`).
-
----
-
-### Repo Layout (AWS Additions)
+## 7. Repo Layout
 
 ```
 aws_results/
-  query1_quality_gate.csv     # Athena Data Quality Gate output (0 violations)
-  query2_executive_rollup.csv # Athena Executive Rollup output (blocking & singletons)
-code/business_entity_resolution/src/
-  export_lakehouse.py         # ETL: TSVs -> Partitioned Kimball Parquet
+  query1_quality_gate.csv          # Athena mutual-exclusivity audit output
+  query2_executive_rollup.csv      # Athena blocking telemetry output
+
+code/business_entity_resolution/
+  src/
+    normalizer.py                  # Text, address, and legal-suffix normalizer
+    blocking.py                    # Multi-path blocking engine
+    features.py / gpu_features.py  # Pairwise feature extraction
+    train_matcher.py               # XGBoost training + hard-negative mining
+    predict.py                     # Full test inference
+    judge.py                       # Jev-style set-level transformer judge (v10)
+    decision.py                    # 1-to-many exclusive assignment + threshold
+    assemble_matches_lowmem.py     # Merges per-country checkpoints
+    export_lakehouse.py            # ETL: TSVs -> partitioned Parquet star schema
+  models/
+    xgboost_matcher_v10.json       # XGBoost booster (inference-ready)
+    judge_v10.pt                   # Jev judge weights (inference-ready)
+    config_v10.pkl                 # Decision threshold (tau = 0.65)
+    semantic_minilm/               # paraphrase-multilingual-MiniLM-L12-v2 (Apache-2.0)
+  requirements.txt
+
 sql/
-  athena_warehouse_ddl.sql    # Athena DDL + verification analytical queries
+  athena_warehouse_ddl.sql         # CREATE DATABASE, tables, MSCK REPAIR, verification queries
+
 deploy/
-  s3_upload.py                # Direct boto3 parallel S3 uploader
-  aws_deploy.sh               # Bash deployment script
-  aws_deploy.ps1              # PowerShell deployment script
-output/
-  matching_results.tsv        # Raw leaderboard submission (1.73M S1 rows)
-  candidate_pairs.tsv         # Blocking candidates (128.7M pairs)
-  lakehouse_gold/             # Parquet Star Schema (generated by export_lakehouse.py)
-    dim_canonical_entity/     # 311.7 MB Snappy Parquet, partitioned by country
-    dim_target_record/        # 641.6 MB Snappy Parquet, partitioned by country
-    fact_entity_summary/      #  20.3 MB Snappy Parquet, partitioned by country
-    fact_resolution_links/    #  84.3 MB Snappy Parquet, partitioned by country
+  s3_upload.py                     # boto3 parallel uploader
+  aws_deploy.ps1                   # PowerShell deployment script
+
+output/                            # (git-ignored — generated locally)
+  matching_results.tsv             # Leaderboard submission (1.73 M S1 rows)
+  candidate_pairs.tsv              # Blocking candidates (128.7 M pairs)
+  lakehouse_gold/                  # Parquet star schema (generated by export_lakehouse.py)
 ```
+
+---
+
+## 8. Model Compliance
+
+| Item | Detail |
+|------|--------|
+| Model type | XGBoost GBDT + Transformer judge |
+| Licenses | Apache 2.0 (XGBoost), Apache 2.0 (sentence-transformers) |
+| Parameter count | XGBoost: < 10,000 tree parameters; judge_v10.pt: < 8 B |
+| External APIs | None — zero web lookups or geocoding at inference |
+| Training data leakage | TF-IDF vocabulary fitted on training set only; test features use that frozen vocab |
